@@ -4,12 +4,15 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from ASR.utils.general import WORDBANK
 from ASR.utils.torch_utils import SpeechSet
 from ASR.utils.torch_utils import speech_collate
 
-class Encoder(nn.Module):
+from torch.utils.tensorboard import SummaryWriter
+
+class Listener(nn.Module):
     def __init__(self, input_size, hidden_size, key_dim=128, value_dim=128):
-        super(Encoder, self).__init__()
+        super(Listener, self).__init__()
         self.init_layer = nn.LSTM(input_size, hidden_size, num_layers=1, bidirectional=True, batch_first=True)
         self.pblstm1 = self._make_layer(hidden_size*2, hidden_size)
         self.pblstm2 = self._make_layer(hidden_size*2, hidden_size)
@@ -60,35 +63,123 @@ class Encoder(nn.Module):
         x = self.fc1(x)
         key, value = self.key_layer(x), self.value_layer(x)
 
-        return key, value
+        return key, value, x_len
+
+class Attention(nn.Module):
+    def __init__(self):
+        super(Attention, self).__init__()
+
+    def forward(self, key, value, token, lens, device):
+        '''
+            Returns attention by conducting batch matrix multiplication between the Listener's speech 
+            representations, and the decoder's LSTMCell's output at the current time step to generate
+            context for the next time step.
+
+            Arguments:
+                Key: (Batch Size, Sequence Length, Num features)
+                Value: (Batch Size, Sequence Length, Num features)
+
+        '''
+        # Obtain energy in the form of a probability distribution by batch-multiplying decoder output with encoder representation
+        energy = torch.bmm(key, token.unsqueeze(2))
+        energy = torch.softmax(energy, axis=1)
+
+        # Create a mask to identify padding values and use that to mask padding values 
+        mask = torch.arange(key.shape[1]).unsqueeze(0) >= lens.unsqueeze(1)
+        energy.masked_fill_(mask.unsqueeze(2).to(device), 1e-9)
+
+        # Finally multiply with value to return context scaled by probability
+        context = torch.bmm(torch.transpose(value, 1,2), energy)[:,:,0]
+        
+        return context
+
+
+class Speller(nn.Module):
+    def __init__(self, num_embeds, embedding_dim, hidden_size):
+        super(Speller, self).__init__()
+        self.hidden_size = hidden_size
+        self.embedding = nn.Embedding(num_embeds, embedding_dim, padding_idx=0)
+        self.lstm1 = nn.LSTMCell(embedding_dim+hidden_size, hidden_size)
+        self.lstm2 = nn.LSTMCell(hidden_size, hidden_size)
+        self.attention = Attention()
+        self.fc_layer = nn.Linear(hidden_size, num_embeds)
+
+    def forward(self, key, value, decode, decode_lens, device):
+
+        # We initialize context with first time-step of encoder's output
+        context = key[:,0,:]
+
+        # Initialize hidden and cell states for two LSTMCells
+        hidden_0, hidden_1 = torch.zeros(key.shape[0], self.hidden_size).to(device), torch.zeros(key.shape[0], self.hidden_size).to(device)
+        cell_0, cell_1 = torch.zeros(key.shape[0], self.hidden_size).to(device), torch.zeros(key.shape[0], self.hidden_size).to(device)
+
+        # Output sequence decodes 
+        decodes = []
+
+        for i in range(decode.shape[0]):
+            # Generate embedding for each character
+            char_embed = self.embedding(decode[:, i])
+
+            # Concatenate context with character embedding to feed into LSTMCell
+            output = torch.cat((context, char_embed), axis=1)
+            
+            # Pass concatenated context through two LSTM layers
+            hidden_0, cell_0 = self.lstm1(output, (hidden_0, cell_0))
+
+            hidden_1, cell_1 = self.lstm2(hidden_0, (hidden_1, cell_1))
+
+            # Obtain a probability distribution over output characters at each time-step
+            out_probs = self.fc_layer(hidden_1)
+            decodes.append(out_probs)
+
+            # Obtain context for next time step via attention
+            context = self.attention(key, value, hidden_1, decode_lens, device)
+
+        return torch.cat(decodes, axis=1)
 
 class Seq2Seq(nn.Module):
-    def __init__(self, input_dim, hidden_dim):
+    def __init__(self, input_dim, hidden_dim, 
+                       key_dim, value_dim, num_embeds,
+                       embedding_dim, hidden_size):
         super(Seq2Seq, self).__init__()
-        self.encoder = Encoder(input_dim, hidden_dim)
+        self.encoder = Listener(input_dim, hidden_dim, key_dim, value_dim)
+        self.decoder = Speller(num_embeds, embedding_dim, hidden_size)
 
-    def forward(self, x, x_len, dec, dec_len):
-        x = self.encoder(x, x_len)
+    def forward(self, x, x_len, dec, dec_len, device):
+        key, value, x_len = self.encoder(x, x_len)
+        preds = self.decoder(key, value, dec, x_len, device)
 
-        return x
+        return preds
 
 class LAS(object):
+    # TODO : Convert this class to inherit from a base ASR class
     def __init__(self, config):
         self.model = None
         self.trainloader, self.devloader = None, None
         
         # Set global parameters
-        self.input_dim = config["mfcc_bands"]
+        input_dim = config["mfcc_bands"]
 
         # Set model specific parameters
         self.lr = config['models']['LAS']['lr']
         self.epochs = config['models']['LAS']['epochs']
         self.batch_size = config['models']['LAS']['batch_size']
-        self.hidden_size = config['models']['LAS']['hidden_size']
+        hidden_size = config['models']['LAS']['hidden_size']
+        key_size = config['models']['LAS']['key_size']
+        value_size = config['models']['LAS']['value_size']
+        embedding_dim = config['models']['LAS']['embedding_dim']
         self.teacher_forcing_decay = config['models']['LAS']['teacher_forcing_decay']
         
         # Initialize the LAS model
-        self.las_model = Seq2Seq(self.input_dim, self.hidden_size)
+        self.las_model = Seq2Seq(input_dim=input_dim, 
+                                 hidden_dim=hidden_size, 
+                                 key_dim=key_size, 
+                                 value_dim=value_size,
+                                 num_embeds=len(WORDBANK),
+                                 embedding_dim=embedding_dim,
+                                 hidden_size=key_size
+                                )
+                                 
  
     def _create_loader(self, data, transcripts, kwargs):
         '''Helper function for creating Torch dataloader'''
@@ -118,8 +209,11 @@ class LAS(object):
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam(self.las_model.parameters(), self.lr)
 
+        # Create a writer object for logging training to Tensorboard
+        #writer = SummaryWriter()
+
         # Train and validate model across specified number of epochs
-        for i in range(self.epochs):
+        for epoch in range(self.epochs):
 
             # Training iteration
             for batch_num, (speech, decode, truth) in enumerate(trainloader):
@@ -129,11 +223,13 @@ class LAS(object):
 
                 # Move data to device
                 speech_data = speech_data.to(device)
+                decode_data = decode_data.to(device)
 
                 # Obtain probability distribution over targets
-                preds = self.las_model(speech_data, speech_lens, decode_data, decode_lens)
+                preds = self.las_model(speech_data, speech_lens, decode_data, decode_lens, device=device)
 
                 print(speech_data.shape)
                 print(preds[0].shape, preds[1].shape)
 
+                #writer.close()
                 raise KeyboardInterrupt
