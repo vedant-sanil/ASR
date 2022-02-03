@@ -1,4 +1,5 @@
 import json
+from tqdm import tqdm
 from turtle import forward
 import torch
 import torch.nn as nn
@@ -116,7 +117,7 @@ class Speller(nn.Module):
         # Output sequence decodes 
         decodes = []
 
-        for i in range(decode.shape[0]):
+        for i in tqdm(range(decode.shape[1])):
             # Generate embedding for each character
             char_embed = self.embedding(decode[:, i])
 
@@ -130,12 +131,14 @@ class Speller(nn.Module):
 
             # Obtain a probability distribution over output characters at each time-step
             out_probs = self.fc_layer(hidden_1)
-            decodes.append(out_probs)
+            decodes.append(out_probs.unsqueeze(1))
 
             # Obtain context for next time step via attention
             context = self.attention(key, value, hidden_1, decode_lens, device)
 
         return torch.cat(decodes, axis=1)
+
+
 
 class Seq2Seq(nn.Module):
     def __init__(self, input_dim, hidden_dim, 
@@ -229,7 +232,7 @@ class LAS(object):
                 preds = self.las_model(speech_data, speech_lens, decode_data, decode_lens, device=device)
 
                 print(speech_data.shape)
-                print(preds[0].shape, preds[1].shape)
+                print(preds.shape)
 
                 #writer.close()
                 raise KeyboardInterrupt
