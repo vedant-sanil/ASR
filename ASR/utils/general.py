@@ -1,3 +1,5 @@
+import numpy as np
+
 WORDBANK = {"@" : 0, 
             "<eos>" : 1,
             "<sos>" : 2, 
@@ -33,3 +35,21 @@ WORDBANK = {"@" : 0,
             "," : 32, 
             "!" : 33, 
             "?" : 34}
+
+INDEXMAP = {v:k for k,v in WORDBANK.items()}
+
+
+def convert_trancript_to_numeric(transcript):
+    '''Converts a transcript string into its numeric embedding and returns it as pytorch string'''
+
+    word_ls = [WORDBANK['<sos>']] + [WORDBANK[t] for t in transcript.strip()] + [WORDBANK['<eos>']]
+    return np.array(word_ls)
+
+
+def convert_numeric_to_transcript(numeric, truncate=False):
+    '''Converts an array of numeric indices into their corresponding characters'''
+    
+    if truncate:
+        return ''.join([INDEXMAP[n] for n in numeric.tolist() if n != 0])
+    else:
+        return ''.join([INDEXMAP[n] for n in numeric.tolist()])

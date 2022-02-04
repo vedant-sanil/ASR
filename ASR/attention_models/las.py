@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from ASR.main import ASRBase
 from ASR.utils.general import WORDBANK
 from ASR.utils.torch_utils import SpeechSet
 from ASR.utils.torch_utils import speech_collate
@@ -69,6 +70,7 @@ class Listener(nn.Module):
 class Attention(nn.Module):
     def __init__(self):
         super(Attention, self).__init__()
+        self.sm = nn.Softmax(dim=1)
 
     def forward(self, key, value, token, lens, device):
         '''
@@ -83,11 +85,11 @@ class Attention(nn.Module):
         '''
         # Obtain energy in the form of a probability distribution by batch-multiplying decoder output with encoder representation
         energy = torch.bmm(key, token.unsqueeze(2))
-        energy = torch.softmax(energy, axis=1)
 
         # Create a mask to identify padding values and use that to mask padding values 
         mask = torch.arange(key.shape[1]).unsqueeze(0) >= lens.unsqueeze(1)
         energy.masked_fill_(mask.unsqueeze(2).to(device), 1e-9)
+        energy = self.sm(energy)
 
         # Finally multiply with value to return context scaled by probability
         context = torch.bmm(torch.transpose(value, 1,2), energy)[:,:,0]
@@ -154,10 +156,8 @@ class Seq2Seq(nn.Module):
 
         return preds
 
-class LAS(object):
-    # TODO : Convert this class to inherit from a base ASR class
+class LAS(ASRBase):
     def __init__(self, config):
-        self.model = None
         self.trainloader, self.devloader = None, None
         
         # Set global parameters
@@ -184,7 +184,7 @@ class LAS(object):
                                 )
                                  
  
-    def _create_loader(self, data, transcripts, kwargs):
+    def create_loader(self, data, transcripts, kwargs):
         '''Helper function for creating Torch dataloader'''
         dataset = SpeechSet(data, transcripts)
         return DataLoader(dataset, **kwargs)
@@ -202,8 +202,8 @@ class LAS(object):
                     'num_workers' : 1}
 
         # Create training data loader and validation data loader
-        trainloader = self._create_loader(train_data, train_transcripts, kwargs)
-        devloader = self._create_loader(dev_data, dev_transcripts, dev_kwargs)
+        trainloader = self.create_loader(train_data, train_transcripts, kwargs)
+        devloader = self.create_loader(dev_data, dev_transcripts, dev_kwargs)
 
         # Define model specific 
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -219,20 +219,32 @@ class LAS(object):
         for epoch in range(self.epochs):
 
             # Training iteration
-            for batch_num, (speech, decode, truth) in enumerate(trainloader):
-                speech_data, speech_lens = speech
-                decode_data, decode_lens = decode
-                truth_data, truth_lens = truth
+            train_decodes, train_groundtruths = [], []
+            self.las_model.train()
+            with torch.autograd.set_detect_anomaly(True):
+                for batch_num, (speech, decode, truth) in enumerate(trainloader):
+                    optimizer.zero_grad()
+                    speech_data, speech_lens = speech
+                    decode_data, decode_lens = decode
+                    truth_data, truth_lens = truth
 
-                # Move data to device
-                speech_data = speech_data.to(device)
-                decode_data = decode_data.to(device)
+                    # Create a mask for masking out padding while computing loss
+                    mask = torch.arange(truth_data.shape[1]).unsqueeze(0) < torch.Tensor(truth_lens).long().unsqueeze(1)
+                    mask = mask.to(device)
 
-                # Obtain probability distribution over targets
-                preds = self.las_model(speech_data, speech_lens, decode_data, decode_lens, device=device)
+                    # Move data to device
+                    speech_data = speech_data.to(device)
+                    decode_data = decode_data.to(device)
+                    truth_data = truth_data.to(device)
 
-                print(speech_data.shape)
-                print(preds.shape)
+                    # Obtain probability distribution over targets
+                    preds = self.las_model(speech_data, speech_lens, decode_data, decode_lens, device=device)
+                    preds = torch.transpose(preds, 1,2).contiguous()
 
-                #writer.close()
-                raise KeyboardInterrupt
+                    # Compute loss between generated predictions and ground truth predictions
+                    loss = criterion(preds, truth_data)
+                    masked_loss = torch.sum(loss*mask)
+                    masked_loss.backward()
+
+                    #writer.close()
+                    raise KeyboardInterrupt

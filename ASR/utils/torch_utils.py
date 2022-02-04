@@ -4,12 +4,6 @@ from torch.utils.data import Dataset
 
 import ASR.utils.general as general
 
-def convert_trancript_to_numeric(transcript):
-    '''Converts a transcript string into its numeric embedding and returns it as pytorch string'''
-
-    word_ls = [general.WORDBANK['<sos>']] + [general.WORDBANK[t] for t in transcript.strip()] + [general.WORDBANK['<eos>']]
-    return torch.Tensor(word_ls).long()
-
 class SpeechSet(Dataset):
     def __init__(self, data, transcripts):
         self.data = data
@@ -23,7 +17,7 @@ class SpeechSet(Dataset):
 
         # Append start of sentence and end of sentence tokens and convert
         # to numeric tensor
-        transcript = convert_trancript_to_numeric(transcript)
+        transcript = torch.from_numpy(general.convert_trancript_to_numeric(transcript)).long()
 
         # Return speech and transcripts as torch tensors and split transcripts
         # for decoding and ground truth
