@@ -92,5 +92,7 @@ def run_model(model, libripath):
     print("Loading pre-processed data")
     train_data, train_transcripts, dev_data, dev_transcripts, test_data, test_transcripts = load_data(feature_path)
 
-    model = train(model, train_data, train_transcripts, dev_data, dev_transcripts)
+    # Evaluate and test the model: Results can be viewed in tensorboard
+    train(model, train_data, train_transcripts, dev_data, dev_transcripts)
+    evaluate(model, test_data, test_transcripts)
     

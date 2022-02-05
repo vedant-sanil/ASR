@@ -1,9 +1,12 @@
 import json
+from copy import deepcopy
 from tqdm import tqdm
 from turtle import forward
 import torch
 import torch.nn as nn
+import numpy as np
 from torch.utils.data import DataLoader
+from torch.distributions import Gumbel
 
 from ASR.main import ASRBase
 from ASR.utils.general import WORDBANK
@@ -36,9 +39,9 @@ class Listener(nn.Module):
             input = input[:,:-1,:]
             lens -= 1
         
-        input = input[:, None, :, :]
+        input = input.unsqueeze(1)
         input = torch.cat((input[:,:,::2,:], input[:,:,1::2,:]), dim=1).mean(axis=1)
-        lens /= 2
+        lens //= 2
 
         input = nn.utils.rnn.pack_padded_sequence(input, lens, batch_first=True, enforce_sorted=False)
         return input, lens
@@ -88,12 +91,14 @@ class Attention(nn.Module):
 
         # Create a mask to identify padding values and use that to mask padding values 
         mask = torch.arange(key.shape[1]).unsqueeze(0) >= lens.unsqueeze(1)
-        energy.masked_fill_(mask.unsqueeze(2).to(device), 1e-9)
+        mask = mask.unsqueeze(2).to(device)
+        energy.masked_fill_(mask, -1e-9)
         energy = self.sm(energy)
 
         # Finally multiply with value to return context scaled by probability
         context = torch.bmm(torch.transpose(value, 1,2), energy)[:,:,0]
         
+        del mask
         return context
 
 
@@ -101,13 +106,20 @@ class Speller(nn.Module):
     def __init__(self, num_embeds, embedding_dim, hidden_size):
         super(Speller, self).__init__()
         self.hidden_size = hidden_size
+        self.num_embeds = num_embeds
         self.embedding = nn.Embedding(num_embeds, embedding_dim, padding_idx=0)
         self.lstm1 = nn.LSTMCell(embedding_dim+hidden_size, hidden_size)
         self.lstm2 = nn.LSTMCell(hidden_size, hidden_size)
         self.attention = Attention()
-        self.fc_layer = nn.Linear(hidden_size, num_embeds)
+        self.character_prob = nn.Linear(hidden_size*2, num_embeds)
 
-    def forward(self, key, value, decode, decode_lens, device):
+        # Probability p is defined as the teacher forcing probability, and is
+        # defined as the probability with which ground truth prediction is shown.
+        # This probability is decayed as training progresses 
+        self.teacher_forcing_prob = 0.95
+        self.gumbel_loc = 0.1
+
+    def forward(self, key, value, device, speech_lens, decode=None):
 
         # We initialize context with first time-step of encoder's output
         context = key[:,0,:]
@@ -119,24 +131,42 @@ class Speller(nn.Module):
         # Output sequence decodes 
         decodes = []
 
-        for i in tqdm(range(decode.shape[1])):
+        prev_pred = torch.zeros(key.shape[0], 1).to(device)
+
+        if decode is not None:
+            embedding = self.embedding(decode)
+            max_len = decode.shape[1]
+        else:
+            max_len = 500
+
+        for i in range(max_len):
             # Generate embedding for each character
-            char_embed = self.embedding(decode[:, i])
+            # With a probability p, we decide whether the model observes
+            # the gold label, or the prediction made at the previous timestep
+            if decode is not None:
+                if np.random.uniform() < self.teacher_forcing_prob:
+                    char_embed = embedding[:,i,:]
+                else:
+                    prev_pred = Gumbel(prev_pred.to('cpu'), torch.tensor([self.gumbel_loc])).sample().to(device)
+                    char_embed = self.embedding(torch.argmax(prev_pred, dim=-1))
+            else:
+                char_embed = self.embedding(torch.argmax(prev_pred, dim=-1))
 
             # Concatenate context with character embedding to feed into LSTMCell
-            output = torch.cat((context, char_embed), axis=1)
+            output = torch.cat((char_embed, context), axis=1)
             
             # Pass concatenated context through two LSTM layers
             hidden_0, cell_0 = self.lstm1(output, (hidden_0, cell_0))
 
             hidden_1, cell_1 = self.lstm2(hidden_0, (hidden_1, cell_1))
 
-            # Obtain a probability distribution over output characters at each time-step
-            out_probs = self.fc_layer(hidden_1)
-            decodes.append(out_probs.unsqueeze(1))
-
             # Obtain context for next time step via attention
-            context = self.attention(key, value, hidden_1, decode_lens, device)
+            context = self.attention(key, value, hidden_1, speech_lens, device)
+
+            # Obtain a probability distribution over output characters at each time-step
+            out_probs = self.character_prob(torch.cat((hidden_1, context), dim=1))
+            decodes.append(out_probs.unsqueeze(1))
+            prev_pred = out_probs 
 
         return torch.cat(decodes, axis=1)
 
@@ -145,23 +175,33 @@ class Speller(nn.Module):
 class Seq2Seq(nn.Module):
     def __init__(self, input_dim, hidden_dim, 
                        key_dim, value_dim, num_embeds,
-                       embedding_dim, hidden_size):
+                       embedding_dim, hidden_size,
+                       device):
         super(Seq2Seq, self).__init__()
         self.encoder = Listener(input_dim, hidden_dim, key_dim, value_dim)
         self.decoder = Speller(num_embeds, embedding_dim, hidden_size)
+        self.device = device
 
-    def forward(self, x, x_len, dec, dec_len, device):
+    def forward(self, x, x_len, dec=None):
         key, value, x_len = self.encoder(x, x_len)
-        preds = self.decoder(key, value, dec, x_len, device)
+        preds = self.decoder(key, value, self.device, x_len, dec)
 
         return preds
+
+
 
 class LAS(ASRBase):
     def __init__(self, config):
         self.trainloader, self.devloader = None, None
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
         # Set global parameters
         input_dim = config["mfcc_bands"]
+
+        self.dics = None        # Stores model weights
+
+        # Create a writer object for logging training to Tensorboard
+        self.writer = SummaryWriter(flush_secs=10, filename_suffix='test')
 
         # Set model specific parameters
         self.lr = config['models']['LAS']['lr']
@@ -172,6 +212,7 @@ class LAS(ASRBase):
         value_size = config['models']['LAS']['value_size']
         embedding_dim = config['models']['LAS']['embedding_dim']
         self.teacher_forcing_decay = config['models']['LAS']['teacher_forcing_decay']
+        self.decode_method = config['models']['LAS']['decode_method']
         
         # Initialize the LAS model
         self.las_model = Seq2Seq(input_dim=input_dim, 
@@ -180,9 +221,12 @@ class LAS(ASRBase):
                                  value_dim=value_size,
                                  num_embeds=len(WORDBANK),
                                  embedding_dim=embedding_dim,
-                                 hidden_size=key_size
+                                 hidden_size=key_size,
+                                 device=self.device
                                 )
-                                 
+
+    def __del__(self):
+        del self.las_model   
  
     def create_loader(self, data, transcripts, kwargs):
         '''Helper function for creating Torch dataloader'''
@@ -195,31 +239,29 @@ class LAS(ASRBase):
         # Define Dataloader arguments for training and validation datasets
         kwargs = {'batch_size' : self.batch_size, 'shuffle' : True,
                 'collate_fn' : speech_collate, 
-                'num_workers' : 0}
+                'num_workers' : 4}
 
         dev_kwargs = {'batch_size' : self.batch_size, 'shuffle' : False,
                     'collate_fn' : speech_collate,
-                    'num_workers' : 1}
+                    'num_workers' : 4}
 
         # Create training data loader and validation data loader
         trainloader = self.create_loader(train_data, train_transcripts, kwargs)
         devloader = self.create_loader(dev_data, dev_transcripts, dev_kwargs)
 
-        # Define model specific 
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.las_model = self.las_model.to(device)
-
-        criterion = nn.CrossEntropyLoss()
+        self.las_model = self.las_model.to(self.device)
+        criterion = nn.CrossEntropyLoss(reduce=False)
         optimizer = torch.optim.Adam(self.las_model.parameters(), self.lr)
 
-        # Create a writer object for logging training to Tensorboard
-        #writer = SummaryWriter()
+        train_tuple = next(iter(trainloader))
+        train_sample = (train_tuple[0][0].to(self.device), torch.Tensor(train_tuple[0][1]).long(), train_tuple[1][0].to(self.device))
+        #self.writer.add_graph(self.las_model, train_sample)
 
         # Train and validate model across specified number of epochs
-        for epoch in range(self.epochs):
+        for epoch in tqdm(range(self.epochs)):
 
             # Training iteration
-            train_decodes, train_groundtruths = [], []
+            train_decodes, train_groundtruths, train_loss = [], [], []
             self.las_model.train()
             with torch.autograd.set_detect_anomaly(True):
                 for batch_num, (speech, decode, truth) in enumerate(trainloader):
@@ -230,21 +272,142 @@ class LAS(ASRBase):
 
                     # Create a mask for masking out padding while computing loss
                     mask = torch.arange(truth_data.shape[1]).unsqueeze(0) < torch.Tensor(truth_lens).long().unsqueeze(1)
-                    mask = mask.to(device)
+                    mask = mask.to(self.device)
 
                     # Move data to device
-                    speech_data = speech_data.to(device)
-                    decode_data = decode_data.to(device)
-                    truth_data = truth_data.to(device)
+                    speech_data = speech_data.to(self.device)
+                    decode_data = decode_data.to(self.device)
+                    truth_data = truth_data.to(self.device)
+                    speech_lens = torch.Tensor(speech_lens).long()
 
                     # Obtain probability distribution over targets
-                    preds = self.las_model(speech_data, speech_lens, decode_data, decode_lens, device=device)
-                    preds = torch.transpose(preds, 1,2).contiguous()
+                    preds = self.las_model(speech_data, speech_lens, decode_data)
+                    preds_trans = torch.transpose(preds, 1,2).contiguous()
 
                     # Compute loss between generated predictions and ground truth predictions
-                    loss = criterion(preds, truth_data)
+                    loss = criterion(preds_trans, truth_data)
                     masked_loss = torch.sum(loss*mask)
                     masked_loss.backward()
 
-                    #writer.close()
-                    raise KeyboardInterrupt
+                    # Clip gradients and perform forward pass to update parameters
+                    nn.utils.clip_grad_norm_(self.las_model.parameters(), 2)
+                    optimizer.step()
+
+                    # Collect metrics for evaluation of model's performance
+                    train_loss.append(masked_loss.item())
+                    if self.decode_method == 'argmax':
+                        train_decodes.extend(torch.argmax(preds, dim=2).detach().cpu().numpy().tolist())
+                        train_groundtruths.extend(truth_data.detach().cpu().numpy().tolist())
+
+                    del speech_data
+                    del decode_data 
+                    del truth_data
+                    del loss
+                    del mask
+                    del masked_loss
+                    del preds
+                    del preds_trans
+                    torch.cuda.empty_cache()
+
+            avg_train_loss = np.mean(train_loss)
+            avg_train_levdist = self.getWER(train_decodes, train_groundtruths)
+
+            self.writer.add_scalar('Loss/Train:', avg_train_loss, epoch)
+            self.writer.add_scalar('Levenshtein Distance/Train:', avg_train_levdist, epoch)
+            self.writer.flush()
+
+            # Decay teacher forcing rate every 4 epochs
+            if epoch % 4 == 0:
+                self.las_model.decoder.teacher_forcing_prob -= 0.5
+            
+            # Validate the model on dev data
+            self.las_model.eval()
+            dev_decodes, dev_groundtruths = [], []
+            min_lev_dist = float("inf")
+            for batch_num, (speech, decode, truth) in enumerate(devloader):
+                speech_data, speech_lens = speech
+                decode_data, decode_lens = decode
+                truth_data, truth_lens = truth
+
+                # Create a mask for masking out padding while computing loss
+                mask = torch.arange(truth_data.shape[1]).unsqueeze(0) < torch.Tensor(truth_lens).long().unsqueeze(1)
+                mask = mask.to(self.device)
+
+                # Move data to device
+                speech_data = speech_data.to(self.device)
+                decode_data = decode_data.to(self.device)
+                truth_data = truth_data.to(self.device)
+                speech_lens = torch.Tensor(speech_lens).long()
+
+                # Obtain probability distribution over targets
+                preds = self.las_model(speech_data, speech_lens)
+                preds_trans = torch.transpose(preds, 1,2).contiguous()
+
+                # Collect metrics for evaluation of model's performance
+                if self.decode_method == 'argmax':
+                    dev_decodes.extend(torch.argmax(preds, dim=2).detach().cpu().numpy().tolist())
+                    dev_groundtruths.extend(truth_data.detach().cpu().numpy().tolist())
+
+
+                del speech_data
+                del decode_data 
+                del truth_data
+                del preds
+                del preds_trans
+                torch.cuda.empty_cache()
+
+            avg_dev_levdist = self.getWER(dev_decodes, dev_groundtruths)
+
+            # Copies the model state for the best perfoming epoch over validation set
+            if avg_dev_levdist < min_lev_dist:
+                self.dics = deepcopy(self.las_model.state_dict())
+                min_lev_dist = avg_dev_levdist
+
+            self.writer.add_scalar('Levenshtein Distance/Dev:', avg_dev_levdist, epoch)
+            self.writer.flush()
+
+        
+        # Loads model with best performance on validation set
+        self.las_model.load_state_dict(self.dics)
+
+    
+    def evaluate(self, test_data, test_transcripts):
+        test_kwargs = {'batch_size' : self.batch_size, 'shuffle' : False,
+                    'collate_fn' : speech_collate,
+                    'num_workers' : 4}        
+
+        testloader = self.create_loader(test_data, test_transcripts, test_kwargs)
+
+        # Validate the model on dev data
+        self.las_model.eval()
+        test_decodes, test_groundtruths = [], []
+        for batch_num, (speech, decode, truth) in enumerate(testloader):
+            speech_data, speech_lens = speech
+            decode_data, decode_lens = decode
+            truth_data, truth_lens = truth
+
+            # Move data to device
+            speech_data = speech_data.to(self.device)
+            decode_data = decode_data.to(self.device)
+            truth_data = truth_data.to(self.device)
+            speech_lens = torch.Tensor(speech_lens).long()
+
+            # Obtain probability distribution over targets
+            preds = self.las_model(speech_data, speech_lens)
+
+            # Collect metrics for evaluation of model's performance
+            if self.decode_method == 'argmax':
+                test_decodes.extend(torch.argmax(preds, dim=2).detach().cpu().numpy().tolist())
+                test_groundtruths.extend(truth_data.detach().cpu().numpy().tolist())
+
+
+            del speech_data
+            del decode_data 
+            del truth_data
+            del preds
+            torch.cuda.empty_cache()
+
+        avg_test_levdist = self.getWER(test_decodes, test_groundtruths)
+
+        self.writer.add_scalar('Levenshtein Distance/Test:', avg_test_levdist)
+        self.writer.flush()

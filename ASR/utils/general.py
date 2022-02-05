@@ -1,3 +1,4 @@
+from typing import List
 import numpy as np
 
 WORDBANK = {"@" : 0, 
@@ -34,7 +35,8 @@ WORDBANK = {"@" : 0,
             "." : 31, 
             "," : 32, 
             "!" : 33, 
-            "?" : 34}
+            "?" : 34,
+            "-" : 35}
 
 INDEXMAP = {v:k for k,v in WORDBANK.items()}
 
@@ -46,10 +48,16 @@ def convert_trancript_to_numeric(transcript):
     return np.array(word_ls)
 
 
-def convert_numeric_to_transcript(numeric, truncate=False):
+def convert_numeric_to_transcript(numeric : List, truncate=False):
     '''Converts an array of numeric indices into their corresponding characters'''
     
     if truncate:
-        return ''.join([INDEXMAP[n] for n in numeric.tolist() if n != 0])
+        ls = []
+        for n in numeric:
+            if n == 1:
+                break
+            ls.append(INDEXMAP[n])
+            
+        return ''.join(ls)
     else:
-        return ''.join([INDEXMAP[n] for n in numeric.tolist()])
+        return ''.join([INDEXMAP[n] for n in numeric])
