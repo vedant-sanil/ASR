@@ -39,8 +39,10 @@ class Listener(nn.Module):
             input = input[:,:-1,:]
             lens -= 1
         
-        input = input.unsqueeze(1)
-        input = torch.cat((input[:,:,::2,:], input[:,:,1::2,:]), dim=1).mean(axis=1)
+        #input = input.unsqueeze(1)
+        #input = torch.cat((input[:,:,::2,:], input[:,:,1::2,:]), dim=1).mean(axis=1)
+        input = input.view(input.shape[0],input.shape[1]//2,2,input.shape[2])
+        input = torch.mean(input, 2)
         lens //= 2
 
         input = nn.utils.rnn.pack_padded_sequence(input, lens, batch_first=True, enforce_sorted=False)
@@ -117,7 +119,7 @@ class Speller(nn.Module):
         # defined as the probability with which ground truth prediction is shown.
         # This probability is decayed as training progresses 
         self.teacher_forcing_prob = 0.95
-        self.gumbel_loc = 0.1
+        self.gumbel_loc = 0.01
 
     def forward(self, key, value, device, speech_lens, decode=None):
 
@@ -164,9 +166,8 @@ class Speller(nn.Module):
             context = self.attention(key, value, hidden_1, speech_lens, device)
 
             # Obtain a probability distribution over output characters at each time-step
-            out_probs = self.character_prob(torch.cat((hidden_1, context), dim=1))
-            decodes.append(out_probs.unsqueeze(1))
-            prev_pred = out_probs 
+            prev_pred = self.character_prob(torch.cat((hidden_1, context), dim=1))
+            decodes.append(prev_pred.unsqueeze(1))
 
         return torch.cat(decodes, axis=1)
 
@@ -239,18 +240,18 @@ class LAS(ASRBase):
         # Define Dataloader arguments for training and validation datasets
         kwargs = {'batch_size' : self.batch_size, 'shuffle' : True,
                 'collate_fn' : speech_collate, 
-                'num_workers' : 4}
+                'num_workers' : 4, "pin_memory":True}
 
         dev_kwargs = {'batch_size' : self.batch_size, 'shuffle' : False,
                     'collate_fn' : speech_collate,
-                    'num_workers' : 4}
+                    'num_workers' : 4, "pin_memory":True}
 
         # Create training data loader and validation data loader
         trainloader = self.create_loader(train_data, train_transcripts, kwargs)
         devloader = self.create_loader(dev_data, dev_transcripts, dev_kwargs)
 
         self.las_model = self.las_model.to(self.device)
-        criterion = nn.CrossEntropyLoss(reduce=False)
+        criterion = nn.CrossEntropyLoss(reduction='none')
         optimizer = torch.optim.Adam(self.las_model.parameters(), self.lr)
 
         train_tuple = next(iter(trainloader))
@@ -294,10 +295,14 @@ class LAS(ASRBase):
                     optimizer.step()
 
                     # Collect metrics for evaluation of model's performance
-                    train_loss.append(masked_loss.item())
+                    train_loss.append(masked_loss.item()/int(torch.sum(mask).item()))
                     if self.decode_method == 'argmax':
                         train_decodes.extend(torch.argmax(preds, dim=2).detach().cpu().numpy().tolist())
                         train_groundtruths.extend(truth_data.detach().cpu().numpy().tolist())
+
+                    if batch_num % 15 == 1:
+                        print("Epoch ", epoch, "Training Loss ", train_loss[-1])
+
 
                     del speech_data
                     del decode_data 
@@ -313,7 +318,7 @@ class LAS(ASRBase):
             avg_train_levdist = self.getWER(train_decodes, train_groundtruths)
 
             self.writer.add_scalar('Loss/Train:', avg_train_loss, epoch)
-            self.writer.add_scalar('Levenshtein Distance/Train:', avg_train_levdist, epoch)
+            self.writer.add_scalar('Levenshtein_Distance/Train:', avg_train_levdist, epoch)
             self.writer.flush()
 
             # Decay teacher forcing rate every 4 epochs
@@ -363,7 +368,7 @@ class LAS(ASRBase):
                 self.dics = deepcopy(self.las_model.state_dict())
                 min_lev_dist = avg_dev_levdist
 
-            self.writer.add_scalar('Levenshtein Distance/Dev:', avg_dev_levdist, epoch)
+            self.writer.add_scalar('Levenshtein_Distance/Dev:', avg_dev_levdist, epoch)
             self.writer.flush()
 
         
@@ -374,7 +379,7 @@ class LAS(ASRBase):
     def evaluate(self, test_data, test_transcripts):
         test_kwargs = {'batch_size' : self.batch_size, 'shuffle' : False,
                     'collate_fn' : speech_collate,
-                    'num_workers' : 4}        
+                    'num_workers' : 4, 'pin_memory':True}        
 
         testloader = self.create_loader(test_data, test_transcripts, test_kwargs)
 
@@ -409,5 +414,5 @@ class LAS(ASRBase):
 
         avg_test_levdist = self.getWER(test_decodes, test_groundtruths)
 
-        self.writer.add_scalar('Levenshtein Distance/Test:', avg_test_levdist)
+        self.writer.add_scalar('Levenshtein_Distance/Test:', avg_test_levdist)
         self.writer.flush()
