@@ -3,8 +3,8 @@
     "sampling_rate" : 16000,
     "models" : {
         "LAS" : {
-            "epochs" : 50,
-            "lr" : 0.001,
+            "epochs" : 75,
+            "lr" : 0.005,
             "teacher_forcing_decay" : 5,
             "batch_size" : 128,
             "hidden_size" : 256,

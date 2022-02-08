@@ -7,27 +7,6 @@ from Levenshtein import distance
 from ASR.utils.preprocess import preprocess
 from ASR.utils.general import convert_numeric_to_transcript
 
-class ASRBase(object):
-    def __init__(self):
-        raise NotImplementedError
-
-    def create_loader(self):
-        raise NotImplementedError
-
-    def train(self):
-        raise NotImplementedError
-
-    def getWER(self, decode, groundtruth):
-        '''
-            Computes average levenshtein distance over a list 
-            of decoded and ground truth strings.
-        '''
-        lev_distances = []
-        for i in range(len(decode)):
-            lev_distances.append(distance(convert_numeric_to_transcript(decode[i], truncate=True), 
-                                          convert_numeric_to_transcript(groundtruth[i], truncate=True)))
-
-        return np.mean(lev_distances)
 
 
 def train(model, train_data, train_transcripts, dev_data=None, dev_transcripts=None):

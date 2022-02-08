@@ -7,8 +7,9 @@ import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader
 from torch.distributions import Gumbel
+from ASR.asr_api import TorchASRBase
 
-from ASR.main import ASRBase
+from ASR.asr_api import TorchASRBase
 from ASR.utils.general import WORDBANK
 from ASR.utils.torch_utils import SpeechSet
 from ASR.utils.torch_utils import speech_collate
@@ -191,18 +192,12 @@ class Seq2Seq(nn.Module):
 
 
 
-class LAS(ASRBase):
+class LAS(TorchASRBase):
     def __init__(self, config):
-        self.trainloader, self.devloader = None, None
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        super(LAS, self).__init__()
         
         # Set global parameters
         input_dim = config["mfcc_bands"]
-
-        self.dics = None        # Stores model weights
-
-        # Create a writer object for logging training to Tensorboard
-        self.writer = SummaryWriter(flush_secs=10, filename_suffix='test')
 
         # Set model specific parameters
         self.lr = config['models']['LAS']['lr']
@@ -322,7 +317,7 @@ class LAS(ASRBase):
             self.writer.flush()
 
             # Decay teacher forcing rate every 4 epochs
-            if epoch % 4 == 0:
+            if epoch % self.teacher_forcing_decay == 0:
                 self.las_model.decoder.teacher_forcing_prob -= 0.5
             
             # Validate the model on dev data
@@ -367,6 +362,7 @@ class LAS(ASRBase):
             if avg_dev_levdist < min_lev_dist:
                 self.dics = deepcopy(self.las_model.state_dict())
                 min_lev_dist = avg_dev_levdist
+                self.saveToFile(dev_decodes, dev_groundtruths, 'decodes/LAS.txt')
 
             self.writer.add_scalar('Levenshtein_Distance/Dev:', avg_dev_levdist, epoch)
             self.writer.flush()
@@ -381,12 +377,12 @@ class LAS(ASRBase):
                     'collate_fn' : speech_collate,
                     'num_workers' : 4, 'pin_memory':True}        
 
-        testloader = self.create_loader(test_data, test_transcripts, test_kwargs)
+        self.testloader = self.create_loader(test_data, test_transcripts, test_kwargs)
 
         # Validate the model on dev data
         self.las_model.eval()
         test_decodes, test_groundtruths = [], []
-        for batch_num, (speech, decode, truth) in enumerate(testloader):
+        for batch_num, (speech, decode, truth) in enumerate(self.testloader):
             speech_data, speech_lens = speech
             decode_data, decode_lens = decode
             truth_data, truth_lens = truth
