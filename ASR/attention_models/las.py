@@ -13,6 +13,7 @@ from ASR.asr_api import TorchASRBase
 from ASR.utils.general import WORDBANK
 from ASR.utils.torch_utils import SpeechSet
 from ASR.utils.torch_utils import speech_collate
+from ASR.utils.general import convert_numeric_to_transcript
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -90,16 +91,16 @@ class Attention(nn.Module):
 
         '''
         # Obtain energy in the form of a probability distribution by batch-multiplying decoder output with encoder representation
-        energy = torch.bmm(key, token.unsqueeze(2))
+        energy = torch.bmm(key, token.unsqueeze(2)).squeeze(2)
 
         # Create a mask to identify padding values and use that to mask padding values 
-        mask = torch.arange(key.shape[1]).unsqueeze(0) >= lens.unsqueeze(1)
-        mask = mask.unsqueeze(2).to(device)
+        mask = torch.arange(energy.shape[1]).unsqueeze(0) >= lens.unsqueeze(1)
+        mask = mask.to(device)
         energy.masked_fill_(mask, -1e-9)
-        energy = self.sm(energy)
+        attention = self.sm(energy)
 
         # Finally multiply with value to return context scaled by probability
-        context = torch.bmm(torch.transpose(value, 1,2), energy)[:,:,0]
+        context = torch.bmm(attention.unsqueeze(1), value).squeeze(1)
         
         del mask
         return context
@@ -237,7 +238,7 @@ class LAS(TorchASRBase):
                 'collate_fn' : speech_collate, 
                 'num_workers' : 4, "pin_memory":True}
 
-        dev_kwargs = {'batch_size' : self.batch_size, 'shuffle' : False,
+        dev_kwargs = {'batch_size' : 1, 'shuffle' : False,
                     'collate_fn' : speech_collate,
                     'num_workers' : 4, "pin_memory":True}
 
@@ -267,8 +268,8 @@ class LAS(TorchASRBase):
                     truth_data, truth_lens = truth
 
                     # Create a mask for masking out padding while computing loss
-                    mask = torch.arange(truth_data.shape[1]).unsqueeze(0) < torch.Tensor(truth_lens).long().unsqueeze(1)
-                    mask = mask.to(self.device)
+                    #mask = torch.arange(truth_data.shape[1]).unsqueeze(0) < torch.Tensor(truth_lens).long().unsqueeze(1)
+                    #mask = mask.to(self.device)
 
                     # Move data to device
                     speech_data = speech_data.to(self.device)
@@ -278,10 +279,16 @@ class LAS(TorchASRBase):
 
                     # Obtain probability distribution over targets
                     preds = self.las_model(speech_data, speech_lens, decode_data)
-                    preds_trans = torch.transpose(preds, 1,2).contiguous()
+                    #preds_trans = torch.transpose(preds, 1,2).contiguous()
+                    preds_trans = preds.contiguous().view(-1, preds.size(-1))
+
+                    mask = torch.zeros(truth_data.size()).to(self.device)
+                    for idx, length in enumerate(truth_lens):
+                        mask[:length, idx] = 1
+                    mask = mask.T.contiguous().view(-1).to(self.device)
 
                     # Compute loss between generated predictions and ground truth predictions
-                    loss = criterion(preds_trans, truth_data)
+                    loss = criterion(preds_trans, truth_data.contiguous().view(-1))
                     masked_loss = torch.sum(loss*mask)
                     masked_loss.backward()
 
@@ -295,8 +302,11 @@ class LAS(TorchASRBase):
                         train_decodes.extend(torch.argmax(preds, dim=2).detach().cpu().numpy().tolist())
                         train_groundtruths.extend(truth_data.detach().cpu().numpy().tolist())
 
-                    if batch_num % 15 == 1:
+                    if batch_num % 25 == 1:
                         print("Epoch ", epoch, "Training Loss ", train_loss[-1])
+                        print(f"Epoch {epoch}/{self.epochs} TRAIN ORIGINAL: ", convert_numeric_to_transcript(train_groundtruths[-1], truncate=True))
+                        print(f"Epoch {epoch}/{self.epochs} TRAIN DECODES: ", convert_numeric_to_transcript(train_decodes[-1], truncate=True))
+                        print("\n")
 
 
                     del speech_data
@@ -317,8 +327,8 @@ class LAS(TorchASRBase):
             self.writer.flush()
 
             # Decay teacher forcing rate every 4 epochs
-            if epoch % self.teacher_forcing_decay == 0:
-                self.las_model.decoder.teacher_forcing_prob -= 0.5
+            if epoch % self.teacher_forcing_decay == 0 and self.teacher_forcing_decay >=0.55:
+                self.las_model.decoder.teacher_forcing_prob -= 0.05
             
             # Validate the model on dev data
             self.las_model.eval()
@@ -348,6 +358,10 @@ class LAS(TorchASRBase):
                     dev_decodes.extend(torch.argmax(preds, dim=2).detach().cpu().numpy().tolist())
                     dev_groundtruths.extend(truth_data.detach().cpu().numpy().tolist())
 
+                if batch_num % 25 == 1:
+                    print(f"Epoch {epoch}/{self.epochs} DEV ORIGINAL: ", convert_numeric_to_transcript(dev_groundtruths[-1], truncate=True))
+                    print(f"Epoch {epoch}/{self.epochs} DEV DECODES: ", convert_numeric_to_transcript(dev_decodes[-1], truncate=True))
+                    print("\n")
 
                 del speech_data
                 del decode_data 

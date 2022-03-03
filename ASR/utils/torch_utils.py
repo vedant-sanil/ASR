@@ -5,9 +5,10 @@ from torch.utils.data import Dataset
 import ASR.utils.general as general
 
 class SpeechSet(Dataset):
-    def __init__(self, data, transcripts):
+    def __init__(self, data, transcripts, return_single_transcript=False):
         self.data = data
         self.transcripts = transcripts
+        self.return_single_transcript = return_single_transcript
 
     def __len__(self):
         return len(self.data)

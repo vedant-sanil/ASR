@@ -12,6 +12,12 @@
             "value_size" : 128,
             "embedding_dim" : 128,
             "decode_method" : "argmax"
+        }, 
+        "RNN-CTC" : {
+            "epochs" : 50,
+            "lr" : 0.001,
+            "batch_size" : 64,
+            "hidden_size" : 128
         }
     }
 }

@@ -59,7 +59,9 @@ class TorchASRBase(ASRBase):
         return DataLoader(dataset, **kwargs)
 
     def train():
+        '''To be implemented in child class'''
         raise NotImplementedError
 
     def evaluate():
+        '''To be implemented in child class'''
         raise NotImplementedError
